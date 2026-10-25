@@ -18,6 +18,11 @@ from config import MotorConfig
 # Motor status register bit 0 = under-voltage. Common on leaders when their rail
 # dips under load and not a real fault — mask it out before gating.
 STATUS_VOLTAGE_BIT = 0x01
+# Bit 5 = overload. A stalled follower (e.g. gripper closed on cheese while the leader
+# keeps squeezing) reports it while its measured current is already throttled low,
+# so the current threshold alone never fires. The Station drops normvla frames while
+# any motor reports an error, which breaks recordings.
+STATUS_OVERLOAD_BIT = 0x20
 
 
 class Direction(Enum):
@@ -156,34 +161,35 @@ def compute_motor_command(
         leader_direction = None
 
     threshold = config.get_current_threshold(motor_id)
-    if threshold > 0:
-        if follower.current >= threshold:
-            # Current is high. Figure out which direction caused it (by comparing
-            # to the previous tick's position) and block that direction.
-            if (
-                protection.blocked_direction is None
-                and protection.previous_position != follower.present_position
-            ):
+    overloaded = (follower.error_status & STATUS_OVERLOAD_BIT) != 0
+    if overloaded or (threshold > 0 and follower.current >= threshold):
+        # Current is high or the servo reports overload. Figure out which direction
+        # caused it (by comparing to the previous tick's position) and block that direction.
+        if protection.blocked_direction is None:
+            if protection.previous_position != follower.present_position:
                 if follower.present_position > protection.previous_position:
                     protection.blocked_direction = Direction.POSITIVE
                 else:
                     protection.blocked_direction = Direction.NEGATIVE
+            else:
+                # Stalled without moving: block whatever the leader is pushing into.
+                protection.blocked_direction = leader_direction
 
-            # Hold position while current is elevated. Only re-issue the goal
-            # if the follower is meaningfully off its current target.
-            if abs(follower.target_position - follower.present_position) > config.deadband:
-                return MotorCommand(motor_id=motor_id, goal=follower.present_position)
-            return None
+        # Hold position while overloaded. Only re-issue the goal
+        # if the follower is meaningfully off its current target.
+        if abs(follower.target_position - follower.present_position) > config.deadband:
+            return MotorCommand(motor_id=motor_id, goal=follower.present_position)
+        return None
 
-        # Current is back to normal. Clear the block only if the leader is now
-        # asking for movement in the opposite direction (the original cause is
-        # likely still mechanically present).
-        if (
-            protection.blocked_direction is not None
-            and leader_direction is not None
-            and leader_direction != protection.blocked_direction
-        ):
-            protection.blocked_direction = None
+    # Load is back to normal. Clear the block only if the leader is now
+    # asking for movement in the opposite direction (the original cause is
+    # likely still mechanically present).
+    if (
+        protection.blocked_direction is not None
+        and leader_direction is not None
+        and leader_direction != protection.blocked_direction
+    ):
+        protection.blocked_direction = None
 
     # Leader still wants to push into the blocked direction — refuse.
     if protection.blocked_direction is not None:

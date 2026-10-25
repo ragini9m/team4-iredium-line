@@ -17,6 +17,10 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+try:  # optional: tensorboard is not in uv.lock (e.g. the cloud bundle)
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 
 from smolvla import SmolVLAPolicy
 from smolvla.dataset import PickAndPlaceDataset, collate_samples
@@ -28,8 +32,6 @@ ROOT = Path(__file__).resolve().parent.parent
 DATASETS = ROOT.parent / "datasets"
 CKPT_DIR = ROOT / "checkpoints"
 IMAGE_KEYS = ("observation.images.cam0", "observation.images.cam1")
-STATE_DIM = 6
-ACTION_DIM = 6
 
 DEFAULT_PARQUETS = [DATASETS / "dataset.parquet"]
 
@@ -60,6 +62,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--base-checkpoint", type=str, default="lerobot/smolvla_base")
     p.add_argument("--output", type=Path, default=CKPT_DIR / "run")
+    p.add_argument("--unfreeze-vision", action="store_true",
+                   help="Also train the VLM incl. vision encoder (default: action expert only). "
+                        "Lets the model learn task progress from the images; needs more GPU memory.")
     return p.parse_args()
 
 
@@ -145,7 +150,7 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
 
     train_ds = PickAndPlaceDataset(args.parquets, image_keys=IMAGE_KEYS)
-    print(f"episodes: {train_ds.total_episodes}  frames: {len(train_ds)}")
+    print(f"episodes: {train_ds.total_episodes}  frames: {len(train_ds)}  joints: {train_ds.n_joints}")
 
     stats = compute_stats(train_ds._state, train_ds._action)
     stats_path = args.output / "stats.safetensors"
@@ -161,10 +166,14 @@ def main() -> None:
         args.base_checkpoint,
         config_overrides={
             "image_keys": list(IMAGE_KEYS),
-            "state_dim": STATE_DIM,
-            "action_dim": ACTION_DIM,
+            # Joint count comes from the data (SO-101: 6, ElRobot: 8); a fixed 6 silently drops the rest.
+            "state_dim": train_ds.n_joints,
+            "action_dim": train_ds.n_joints,
             "load_vlm_weights": False,
             "empty_cameras": 0,
+            # train_expert_only=True freezes the whole VLM incl. vision, so both must be off to unfreeze.
+            "freeze_vision_encoder": not args.unfreeze_vision,
+            "train_expert_only": not args.unfreeze_vision,
         },
         strict=False,
     ).to(device)
@@ -192,6 +201,9 @@ def main() -> None:
 
     train_loader = make_loader(train_ds, args.batch_size, shuffle=True, num_workers=args.num_workers)
     print(f"train batches/epoch: {len(train_loader)}")
+
+    # TensorBoard: `tensorboard --logdir <output>/tb`
+    writer = SummaryWriter(log_dir=str(args.output / "tb")) if SummaryWriter else None
 
     step = 0
     t0 = time.time()
@@ -221,6 +233,10 @@ def main() -> None:
                 lr = sched.get_last_lr()[0]
                 print(f"step {step+1:>6}/{args.steps}  loss {avg:.4f}  lr {lr:.2e}  "
                       f"({(step+1) / max(dt, 1e-9):.2f} step/s)")
+                if writer:
+                    writer.add_scalar("train/loss", avg, step + 1)
+                    writer.add_scalar("train/lr", lr, step + 1)
+                    writer.add_scalar("perf/steps_per_s", (step + 1) / max(dt, 1e-9), step + 1)
                 running_loss, running_n = 0.0, 0
 
             if (step + 1) % args.save_every == 0:
@@ -231,6 +247,8 @@ def main() -> None:
 
             step += 1
 
+    if writer:
+        writer.close()
     final = args.output / "final"
     policy.save_pretrained(final)
     (final / "stats.safetensors").write_bytes(stats_path.read_bytes())

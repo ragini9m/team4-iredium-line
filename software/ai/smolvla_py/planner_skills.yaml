@@ -1,0 +1,66 @@
+# Skill library for scripts/planner.py.
+# Paths are relative to the smolvla_py directory. A skill whose checkpoint does
+# not exist is rejected when the plan is built, before the robot moves.
+
+robot:
+  server: localhost
+  bus_serial: "5B3E090065"
+  motor_ids: [1, 2, 3, 4, 5, 6, 7, 8]
+  gripper_motor_id: 8
+  # Rest pose the rc3 demos start and end in (raw ticks, motors 1-8, gripper open).
+  # The older cheese-v1 / pizza-smolvla-hf models used [2056, 1020, 1979, 3076, 1817, 2343, 2458, 1275].
+  home_pose: [2047, 1016, 964, 3149, 1886, 2983, 2197, 2765]
+
+execution:
+  fps: 10
+  actions_per_predict: 10
+  max_delta_ticks: 200          # per action, arm joints
+  gripper_max_delta_ticks: 1700
+  home_start_tolerance: 600     # sum |pos - home| (motors 1-7) required before the first step
+
+done:
+  # A step is done once the arm has worked (left home) and is back home for a while,
+  # or stood still (disabled: arm can be still for >4 s while working), or timed out.
+  work_distance: 1500           # sum |pos - home| over motors 1-7 that counts as "working"
+  home_distance: 400            # ... that counts as "back home" (idle at home measured <= ~280)
+  home_hold_s: 2.0
+  still_window_s: 0             # 0 = disabled
+  still_ticks: 25
+  start_timeout_s: 20           # fail the step if the arm never leaves home
+
+skills:
+  cheese:
+    # Staged: trained on make_stage_dataset.py output (one prompt per drop), see that script.
+    synonyms: [cheese, mozzarella]
+    checkpoint: checkpoints/modelA/final
+    stages: 7
+    stage_prompt: "Put cheese on spot {k} of {n}."
+    stage_timeout_s: 40
+    timeout_s: 150
+
+  cheese_single:
+    # One prompt for the whole routine (cheese-rc3 / cheese-rc3-unfrozen). Use with --plan cheese_single.
+    synonyms: []
+    checkpoint: checkpoints/cheese-rc3-unfrozen/final
+    prompt: "Spread the cheese relatively evenly over the pizza."
+    timeout_s: 150
+
+  salami:
+    # Recorded one episode per piece (record_episodes.py --stages 6): every stage ends back home.
+    synonyms: [salami, pepperoni]
+    checkpoint: checkpoints/modelA/final
+    stages: 6
+    stage_prompt: "Put salami on spot {k} of {n}."
+    stage_done: drop_home        # placed, then near home (< done.placed_home_distance) ends the stage
+    stage_timeout_s: 60          # one slice ~20 s; room for a retry after a failed grip
+    default_count: 6
+    trained_counts: [6]
+    timeout_s: 170
+
+  mushroom:
+    synonyms: [mushroom, champignon]
+    checkpoint: checkpoints/mushroom-v1        # TODO: not trained yet
+    prompt: "Place {count} mushroom pieces on the pizza and spread them over the pizza relatively evenly."
+    default_count: 6
+    trained_counts: [6]
+    timeout_s: 170

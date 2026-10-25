@@ -78,6 +78,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-delta-ticks", type=int, default=200,
                    help="Abort a tick if the predicted goal is more than this many ticks "
                         "from the current position on any joint. 0 to disable.")
+    p.add_argument("--gripper-motor-id", type=int, default=0,
+                   help="Motor ID of the gripper; it gets --gripper-max-delta-ticks instead of "
+                        "--max-delta-ticks (grippers open/close in one big step). 0 = no gripper.")
+    p.add_argument("--gripper-max-delta-ticks", type=int, default=1000,
+                   help="Safety limit for the gripper motor. 0 to disable.")
+    p.add_argument("--clamp", action="store_true",
+                   help="Instead of aborting a tick that exceeds a limit, move each joint at most "
+                        "its limit toward the prediction. Avoids the arm freezing when the policy "
+                        "keeps predicting a step above the limit.")
     p.add_argument("--auto", action="store_true",
                    help="Run continuously — predict + send each tick, no SPACE. Ctrl-C to stop.")
     p.add_argument("--max-ticks", type=int, default=0,
@@ -185,7 +194,12 @@ def predict_commands(
     batch["observation.language.tokens"] = tokens
     batch["observation.language.attention_mask"] = mask
 
-    pred_norm = policy.predict_action_chunk(batch)[0]        # (chunk_size, 6)
+    # Same bf16 autocast as training: the SDPA attention path needs the bf16 VLM
+    # and fp32 expert tensors cast to one dtype.
+    use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+        pred_norm = policy.predict_action_chunk(batch)[0]    # (chunk_size, n_joints)
+    pred_norm = pred_norm.float()
     pred_goal = unnormalize_action(pred_norm, stats)          # in [0, 1]-ish
     next_goal = pred_goal[0].cpu().clamp(0.0, 1.0).numpy()    # (6,)
 
@@ -204,19 +218,23 @@ def print_preview(
     pred_raw: np.ndarray,
     ranges: list[tuple[int, int]],
     header: str = "",
-) -> int:
-    """Print a compact comparison table and return max |delta_ticks| across joints."""
+    gripper_motor_id: int = 0,
+) -> tuple[int, int]:
+    """Print a compact comparison table and return (max |delta_ticks| across non-gripper
+    joints, |delta_ticks| of the gripper or 0)."""
     joints = frame.get_joints() or []
     deltas = [int(r) - int(j.get_position()) for r, j in zip(pred_raw, joints)]
-    max_delta = max(abs(d) for d in deltas) if deltas else 0
+    arm = [abs(d) for mid, d in zip(motor_ids, deltas) if mid != gripper_motor_id]
+    max_delta = max(arm) if arm else 0
+    gripper_delta = next((abs(d) for mid, d in zip(motor_ids, deltas) if mid == gripper_motor_id), 0)
 
     if header:
-        print(f"[{header}]  max|Δ|={max_delta}")
+        print(f"[{header}]  max|Δ|={max_delta}  gripper|Δ|={gripper_delta}")
     print(f"  {'motor':>5}  {'pos':>6}  {'pred':>6}  {'Δ':>6}  {'pred_norm':>9}")
     for mid, j, gn, raw, d in zip(motor_ids, joints, pred_goal_norm, pred_raw, deltas):
         print(f"  {mid:>5}  {int(j.get_position()):>6}  {int(raw):>6}  "
               f"{d:>+6}  {gn:>9.4f}")
-    return max_delta
+    return max_delta, gripper_delta
 
 
 async def read_key() -> str:
@@ -233,15 +251,31 @@ async def run_one_tick(
         frame, policy, stats, args.task, args.bus_serial, motor_ids, device
     )
     t_predicted = time.perf_counter()
-    max_delta = print_preview(
-        motor_ids, frame, pred_norm, pred_raw, ranges, header=f"tick {tick}"
+    max_delta, gripper_delta = print_preview(
+        motor_ids, frame, pred_norm, pred_raw, ranges, header=f"tick {tick}",
+        gripper_motor_id=args.gripper_motor_id,
     )
 
     fetch_ms = (t_fetched - t_start) * 1000
     predict_ms = (t_predicted - t_fetched) * 1000
 
-    if args.max_delta_ticks and max_delta > args.max_delta_ticks:
+    over_arm = args.max_delta_ticks and max_delta > args.max_delta_ticks
+    over_gripper = args.gripper_max_delta_ticks and gripper_delta > args.gripper_max_delta_ticks
+    if args.clamp and (over_arm or over_gripper):
+        clamped = []
+        for mid, raw, j in zip(motor_ids, pred_raw, frame.get_joints() or []):
+            limit = args.gripper_max_delta_ticks if mid == args.gripper_motor_id else args.max_delta_ticks
+            pos = int(j.get_position())
+            clamped.append(max(pos - limit, min(pos + limit, int(raw))) if limit else int(raw))
+        cmd = build_sync_write_command(args.bus_serial, motor_ids, clamped)
+        print(f"  clamped to ±limit: {[c - int(j.get_position()) for c, j in zip(clamped, frame.get_joints())]}")
+        over_arm = over_gripper = False
+
+    if over_arm:
         print(f"  aborted: max|Δ|={max_delta} > {args.max_delta_ticks} ticks  "
+              f"(fetch {fetch_ms:.0f}ms, predict {predict_ms:.0f}ms)\n")
+    elif over_gripper:
+        print(f"  aborted: gripper|Δ|={gripper_delta} > {args.gripper_max_delta_ticks} ticks  "
               f"(fetch {fetch_ms:.0f}ms, predict {predict_ms:.0f}ms)\n")
     else:
         await send_commands(client, [cmd])
@@ -321,7 +355,9 @@ async def main_async() -> None:
     print(f"server:    {args.server}")
     print(f"bus:       {args.bus_serial}")
     print(f"motors:    {motor_ids}")
-    print(f"safety:    max_delta_ticks={args.max_delta_ticks}")
+    print(f"safety:    max_delta_ticks={args.max_delta_ticks}"
+          + (f", gripper motor {args.gripper_motor_id}: {args.gripper_max_delta_ticks}"
+             if args.gripper_motor_id else ""))
 
     client = await new_station_client(args.server, logger)
     if args.auto:

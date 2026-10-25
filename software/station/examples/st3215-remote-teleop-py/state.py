@@ -10,7 +10,7 @@ RAM_ACC = 0x29
 RAM_GOAL_POSITION = 0x2A
 RAM_GOAL_SPEED = 0x2E
 RAM_PRESENT_POSITION = 0x38
-RAM_STATUS = 0x40
+RAM_STATUS = 0x41  # "Motor Status" (st3215 driver memory.rs); 0x40 never carries the error bits
 RAM_PRESENT_CURRENT = 0x45
 
 # Position field is 16 bits but the high bit is a sign flag (negative encoder).
